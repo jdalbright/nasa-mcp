@@ -11,6 +11,10 @@ A local stdio MCP server that turns NASA's public APIs into compact, assistant-f
 - `nasa_earth_events` — current/recent wildfires, storms, volcanoes, icebergs, floods, and other EONET events.
 - `nasa_space_weather` — DONKI notifications or event feeds such as flares, CMEs, and geomagnetic storms.
 - `nasa_epic_earth` — recent DSCOVR/EPIC full-disc Earth imagery with direct image URLs.
+- `nasa_power_daily` — historical daily weather, solar-resource, and agricultural data for a latitude/longitude in compact columnar series.
+- `nasa_power_climatology` — monthly and annual climate normals for a location using NASA POWER's standard 2001–2020 baseline.
+
+NASA POWER tools provide `weather`, `solar`, and `agriculture` presets, or up to ten explicitly selected parameter codes. The agriculture preset defaults to POWER's `AG` community; other requests default to `RE`, with `SB` also available when community-specific units are needed. Daily requests are limited to 366 calendar days and 2,000 parameter-day values, radiation parameters begin on 1984-01-01, and responses clearly identify the data as historical rather than a forecast.
 
 ## Setup
 
@@ -20,9 +24,9 @@ npm test
 npm run smoke
 ```
 
-The smoke test always exercises the four keyless live tools. It exercises APOD, DONKI, and the combined daily brief only when a registered `NASA_API_KEY` is configured; degraded API-keyed sections do not receive a false green.
+The smoke test always exercises the six keyless live tools. It exercises APOD, DONKI, and the combined daily brief only when a registered `NASA_API_KEY` is configured; degraded API-keyed sections do not receive a false green.
 
-`NASA_API_KEY` is optional. Without it, the server uses NASA's `DEMO_KEY` (30 requests/hour and 50/day per IP). EONET, EPIC, and the NASA media library are keyless. For regular use, create a free key at <https://api.nasa.gov/> and expose it as `NASA_API_KEY` in the MCP server environment.
+`NASA_API_KEY` is optional. Without it, the server uses NASA's `DEMO_KEY` (30 requests/hour and 50/day per IP). EONET, EPIC, NASA POWER, and the NASA media library are keyless. For regular use, create a free key at <https://api.nasa.gov/> and expose it as `NASA_API_KEY` in the MCP server environment.
 
 ## Run
 
@@ -40,4 +44,4 @@ The server speaks MCP over stdio. Logs go to stderr; stdout is reserved for prot
 - `nasa_daily_brief` returns partial results when one upstream API is unavailable, including shared `DEMO_KEY` throttling.
 - NASA API keys are redacted from returned source URLs; rate-limit headers are surfaced when available.
 
-Sources: NASA Open APIs, NASA Image and Video Library, EONET v3, DONKI, and EPIC.
+Sources: NASA Open APIs, NASA Image and Video Library, EONET v3, DONKI, EPIC, and NASA POWER.

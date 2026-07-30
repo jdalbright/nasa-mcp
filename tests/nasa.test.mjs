@@ -8,15 +8,125 @@ import {
   normalizeAssetLinks,
   normalizeEarthEvents,
   normalizeMediaSearch,
+  normalizePowerData,
+  resolvePowerCommunity,
+  resolvePowerParameters,
   validateApodDate,
   validateDate,
   validateDateRange,
+  validatePowerCoordinates,
+  validatePowerDateRange,
+  validatePowerParameterCoverage,
+  validatePowerRequestSize,
 } from "../dist/nasa.js";
 
 test("boundedTextInput trims normal input and rejects context-flooding values", () => {
   assert.equal(boundedTextInput("  Apollo 11  ", "query", 200), "Apollo 11");
   assert.throws(() => boundedTextInput("x".repeat(201), "query", 200), /at most 200/);
   assert.throws(() => boundedTextInput({ q: "Apollo" }, "query", 200), /must be a string/);
+});
+
+test("NASA POWER coordinates, dates, and parameter profiles are bounded", () => {
+  assert.deepEqual(validatePowerCoordinates(35.7796, -78.6382), { latitude: 35.7796, longitude: -78.6382 });
+  assert.throws(() => validatePowerCoordinates(91, 0), /latitude/);
+  assert.throws(() => validatePowerCoordinates(0, "-78"), /longitude/);
+  assert.deepEqual(validatePowerDateRange("2025-07-01", "2025-07-03"), {
+    start: "20250701",
+    end: "20250703",
+    start_date: "2025-07-01",
+    end_date: "2025-07-03",
+  });
+  assert.throws(() => validatePowerDateRange("1980-12-31", "1981-01-01"), /1981-01-01/);
+  assert.throws(() => validatePowerDateRange("2024-01-01", "2026-01-01"), /at most 366/);
+  assert.deepEqual(resolvePowerParameters(undefined, "solar"), [
+    "ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_UV_INDEX", "T2M", "WS10M",
+  ]);
+  assert.deepEqual(resolvePowerParameters(["T2M", "PRECTOTCORR"], undefined), ["T2M", "PRECTOTCORR"]);
+  assert.equal(resolvePowerCommunity(undefined, "agriculture", undefined), "AG");
+  assert.equal(resolvePowerCommunity(undefined, "solar", undefined), "RE");
+  assert.equal(resolvePowerCommunity("SB", undefined, ["T2M"]), "SB");
+  assert.throws(() => resolvePowerCommunity("NOPE", undefined, undefined), /community must be one of/);
+  assert.doesNotThrow(() => validatePowerParameterCoverage(["T2M", "ALLSKY_SFC_SW_DWN"], "1984-01-01"));
+  assert.throws(() => validatePowerParameterCoverage(["T2M", "ALLSKY_SFC_SW_DWN"], "1983-12-31"), /available from 1984-01-01/);
+  assert.doesNotThrow(() => validatePowerRequestSize("2025-01-01", "2025-12-31", 5));
+  assert.throws(() => validatePowerRequestSize("2025-01-01", "2025-12-31", 10), /at most 2000/);
+  assert.throws(() => resolvePowerParameters(["T2M", "T2M"], undefined), /unique/);
+  assert.throws(() => resolvePowerParameters(["NOT_REAL"], undefined), /unsupported/);
+});
+
+test("NASA POWER responses become compact columnar series with fill values removed", () => {
+  const result = normalizePowerData({
+    geometry: { coordinates: [-78.638, 35.78, 123.49] },
+    header: { time_standard: "LST", start: "20250701", end: "20250702", fill_value: -999 },
+    parameters: {
+      T2M: { units: "C", longname: "Temperature at 2 Meters" },
+      PRECTOTCORR: { units: "mm/day", longname: "Precipitation Corrected" },
+    },
+    properties: { parameter: {
+      T2M: { "20250701": 28.75, "20250702": 25.61 },
+      PRECTOTCORR: { "20250701": -999, "20250702": 17.81 },
+    } },
+    messages: [],
+  });
+  assert.deepEqual(result.location, { longitude: -78.638, latitude: 35.78, elevation_m: 123.49 });
+  assert.deepEqual(result.data.periods, ["2025-07-01", "2025-07-02"]);
+  assert.deepEqual(result.data.series.PRECTOTCORR, [null, 17.81]);
+  assert.deepEqual(result.data.series.T2M, [28.75, 25.61]);
+  assert.equal(result.parameters.T2M.units, "C");
+});
+
+test("NASA POWER climatology periods use calendar order with annual last", () => {
+  const result = normalizePowerData({
+    header: { fill_value: -999 },
+    parameters: { T2M: { units: "C", longname: "Temperature at 2 Meters" } },
+    properties: { parameter: { T2M: { ANN: 15.39, MAR: 9.53, JAN: 3.42, FEB: 5.24 } } },
+  });
+  assert.deepEqual(result.data.periods, ["JAN", "FEB", "MAR", "ANN"]);
+});
+
+test("NASA POWER full-year solar output stays compact in MCP text form", () => {
+  const periods = {};
+  for (let day = 1; day <= 366; day += 1) {
+    const date = new Date(Date.UTC(2024, 0, day)).toISOString().slice(0, 10).replace(/-/g, "");
+    periods[date] = day / 10;
+  }
+  const codes = ["ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_UV_INDEX", "T2M", "WS10M"];
+  const parameter = Object.fromEntries(codes.map((code) => [code, periods]));
+  const parameters = Object.fromEntries(codes.map((code) => [code, { units: "unit", longname: code }]));
+  const normalized = normalizePowerData({ header: { fill_value: -999 }, parameters, properties: { parameter } });
+  assert.ok(Buffer.byteLength(JSON.stringify(normalized, null, 2)) < 40_000);
+});
+
+test("NASA POWER daily requests use the documented time-standard parameter", async () => {
+  const { handleTool } = await import("../dist/nasa.js");
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (input) => {
+    requestedUrl = String(input);
+    return new Response(JSON.stringify({
+      geometry: { coordinates: [-78.638, 35.78, 123.49] },
+      header: { time_standard: "UTC", start: "20250701", end: "20250701", fill_value: -999 },
+      parameters: { T2M: { units: "C", longname: "Temperature at 2 Meters" } },
+      properties: { parameter: { T2M: { "20250701": 28.75 } } },
+      messages: [],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const result = await handleTool("nasa_power_daily", {
+      latitude: 35.7796,
+      longitude: -78.6382,
+      start_date: "2025-07-01",
+      end_date: "2025-07-01",
+      parameters: ["T2M"],
+      time_standard: "UTC",
+    });
+    const request = new URL(requestedUrl);
+    assert.equal(request.searchParams.get("time-standard"), "UTC");
+    assert.equal(request.searchParams.has("time_standard"), false);
+    assert.equal(result.time_standard, "UTC");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("tool handlers enforce JSON-schema types and reject unknown arguments", async () => {

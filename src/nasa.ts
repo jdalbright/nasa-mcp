@@ -2,8 +2,22 @@ const NASA_BASE = "https://api.nasa.gov";
 const MEDIA_BASE = "https://images-api.nasa.gov";
 const EONET_BASE = "https://eonet.gsfc.nasa.gov/api/v3";
 const EPIC_BASE = "https://epic.gsfc.nasa.gov";
+const POWER_BASE = "https://power.larc.nasa.gov";
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_ERROR_BODY = 600;
+const MAX_POWER_DATA_CELLS = 2_000;
+
+export const POWER_PARAMETER_CODES = [
+  "T2M", "T2M_MIN", "T2M_MAX", "T2MDEW", "RH2M", "PRECTOTCORR", "WS10M", "WD10M", "PS",
+  "ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_UV_INDEX", "GWETROOT", "GWETTOP", "TS",
+] as const;
+
+const POWER_PROFILES: Record<string, readonly string[]> = {
+  weather: ["T2M", "T2M_MIN", "T2M_MAX", "RH2M", "PRECTOTCORR", "WS10M"],
+  solar: ["ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_UV_INDEX", "T2M", "WS10M"],
+  agriculture: ["T2M", "T2M_MIN", "T2M_MAX", "PRECTOTCORR", "RH2M", "GWETROOT", "GWETTOP"],
+};
+const POWER_CLIMATOLOGY_PERIODS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC", "ANN"];
 
 export type JsonObject = Record<string, any>;
 
@@ -114,6 +128,41 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "nasa_power_daily",
+    description: "Get historical daily NASA POWER weather, solar-resource, or agricultural data for one latitude/longitude. This is analysis-ready historical data, not a forecast. Returns compact columnar series with units.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        latitude: { type: "number", minimum: -90, maximum: 90 },
+        longitude: { type: "number", minimum: -180, maximum: 180 },
+        start_date: { type: "string", description: "Start date in YYYY-MM-DD format. Meteorological parameters begin 1981-01-01; radiation parameters and the solar profile begin 1984-01-01." },
+        end_date: { type: "string", description: "End date in YYYY-MM-DD format; range is capped at 366 calendar days and 2,000 returned parameter-day values." },
+        profile: { type: "string", enum: ["weather", "solar", "agriculture"], description: "Preset parameter group. Defaults to weather when parameters is omitted." },
+        parameters: { type: "array", items: { type: "string", enum: POWER_PARAMETER_CODES }, minItems: 1, maxItems: 10, uniqueItems: true, description: "Optional NASA POWER parameter codes; overrides the default profile and cannot be combined with profile." },
+        community: { type: "string", enum: ["RE", "AG", "SB"], description: "POWER user community controlling community-specific units. Defaults to AG for the agriculture profile and RE otherwise." },
+        time_standard: { type: "string", enum: ["LST", "UTC"], default: "LST" },
+      },
+      required: ["latitude", "longitude", "start_date", "end_date"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "nasa_power_climatology",
+    description: "Get NASA POWER monthly and annual climatology for one latitude/longitude using the standard 2001-2020 baseline. Useful for typical weather, rainfall, wind, solar potential, and growing conditions; not a forecast.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        latitude: { type: "number", minimum: -90, maximum: 90 },
+        longitude: { type: "number", minimum: -180, maximum: 180 },
+        profile: { type: "string", enum: ["weather", "solar", "agriculture"], description: "Preset parameter group. Defaults to weather when parameters is omitted." },
+        parameters: { type: "array", items: { type: "string", enum: POWER_PARAMETER_CODES }, minItems: 1, maxItems: 10, uniqueItems: true, description: "Optional NASA POWER parameter codes; overrides the default profile and cannot be combined with profile." },
+        community: { type: "string", enum: ["RE", "AG", "SB"], description: "POWER user community controlling community-specific units. Defaults to AG for the agriculture profile and RE otherwise." },
+      },
+      required: ["latitude", "longitude"],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 function boundedInt(value: unknown, fallback: number, min: number, max: number, name: string): number {
@@ -132,6 +181,8 @@ const TOOL_ARG_KEYS: Record<string, Set<string>> = {
   nasa_earth_events: new Set(["status", "days", "category", "bbox", "limit"]),
   nasa_space_weather: new Set(["event_type", "start_date", "end_date", "days", "limit"]),
   nasa_epic_earth: new Set(["collection", "date", "limit"]),
+  nasa_power_daily: new Set(["latitude", "longitude", "start_date", "end_date", "profile", "parameters", "community", "time_standard"]),
+  nasa_power_climatology: new Set(["latitude", "longitude", "profile", "parameters", "community"]),
 };
 
 function assertToolArgs(name: string, args: unknown): asserts args is JsonObject {
@@ -206,6 +257,120 @@ export function validateDateRange(startValue: unknown, endValue: unknown, maxDay
   if (span < 0) throw new Error("end_date must be on or after start_date");
   if (span > maxDays) throw new Error(`date range must be at most ${maxDays} days`);
   return { start, end };
+}
+
+export function validatePowerCoordinates(latitudeValue: unknown, longitudeValue: unknown): { latitude: number; longitude: number } {
+  if (typeof latitudeValue !== "number" || !Number.isFinite(latitudeValue) || latitudeValue < -90 || latitudeValue > 90) {
+    throw new Error("latitude must be a finite number from -90 to 90");
+  }
+  if (typeof longitudeValue !== "number" || !Number.isFinite(longitudeValue) || longitudeValue < -180 || longitudeValue > 180) {
+    throw new Error("longitude must be a finite number from -180 to 180");
+  }
+  return { latitude: latitudeValue, longitude: longitudeValue };
+}
+
+export function validatePowerDateRange(startValue: unknown, endValue: unknown): { start: string; end: string; start_date: string; end_date: string } {
+  const startDate = validateDate(startValue, "start_date");
+  const endDate = validateDate(endValue, "end_date");
+  if (startDate < "1981-01-01") throw new Error("start_date must be on or after 1981-01-01");
+  if (endDate > isoToday()) throw new Error("end_date cannot be in the future");
+  const span = (Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000;
+  if (span < 0) throw new Error("end_date must be on or after start_date");
+  if (span > 365) throw new Error("NASA POWER daily requests may include at most 366 calendar days");
+  return {
+    start: startDate.replace(/-/g, ""),
+    end: endDate.replace(/-/g, ""),
+    start_date: startDate,
+    end_date: endDate,
+  };
+}
+
+export function resolvePowerParameters(parametersValue: unknown, profileValue: unknown): string[] {
+  if (parametersValue !== undefined && profileValue !== undefined) throw new Error("parameters cannot be combined with profile");
+  if (parametersValue === undefined) {
+    const profile = enumInput(profileValue, "weather", Object.keys(POWER_PROFILES), "profile");
+    return [...POWER_PROFILES[profile]];
+  }
+  if (!Array.isArray(parametersValue) || parametersValue.length < 1 || parametersValue.length > 10) {
+    throw new Error("parameters must be an array containing 1 to 10 NASA POWER parameter codes");
+  }
+  if (parametersValue.some((value) => typeof value !== "string")) throw new Error("parameters must contain only strings");
+  const parameters = parametersValue as string[];
+  if (new Set(parameters).size !== parameters.length) throw new Error("parameters must be unique");
+  const unsupported = parameters.filter((value) => !POWER_PARAMETER_CODES.includes(value as typeof POWER_PARAMETER_CODES[number]));
+  if (unsupported.length) throw new Error(`unsupported NASA POWER parameter: ${unsupported.join(", ")}`);
+  return [...parameters];
+}
+
+export function resolvePowerCommunity(communityValue: unknown, profileValue: unknown, parametersValue: unknown): string {
+  if (communityValue !== undefined) return enumInput(communityValue, "RE", ["RE", "AG", "SB"], "community");
+  return parametersValue === undefined && profileValue === "agriculture" ? "AG" : "RE";
+}
+
+export function validatePowerParameterCoverage(parameters: string[], startDate: string): void {
+  const radiationCodes = parameters.filter((parameter) => ["ALLSKY_SFC_SW_DWN", "CLRSKY_SFC_SW_DWN", "ALLSKY_SFC_UV_INDEX"].includes(parameter));
+  if (radiationCodes.length > 0 && startDate < "1984-01-01") {
+    throw new Error(`NASA POWER radiation parameters are available from 1984-01-01; requested: ${radiationCodes.join(", ")}`);
+  }
+}
+
+export function validatePowerRequestSize(startDate: string, endDate: string, parameterCount: number): void {
+  const days = ((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000) + 1;
+  const cells = days * parameterCount;
+  if (cells > MAX_POWER_DATA_CELLS) {
+    throw new Error(`NASA POWER request would return ${cells} daily values; reduce the date range or parameters to at most ${MAX_POWER_DATA_CELLS}`);
+  }
+}
+
+function formatPowerPeriod(period: string): string {
+  return /^\d{8}$/.test(period) ? `${period.slice(0, 4)}-${period.slice(4, 6)}-${period.slice(6, 8)}` : period;
+}
+
+export function normalizePowerData(data: JsonObject): JsonObject {
+  const parameterValues = data?.properties?.parameter ?? {};
+  const codes = Object.keys(parameterValues).slice(0, 10);
+  const periodSet = new Set<string>();
+  for (const code of codes) {
+    for (const period of Object.keys(parameterValues[code] ?? {})) periodSet.add(period);
+  }
+  const periods = Array.from(periodSet).sort((a, b) => {
+    const aIndex = POWER_CLIMATOLOGY_PERIODS.indexOf(a);
+    const bIndex = POWER_CLIMATOLOGY_PERIODS.indexOf(b);
+    if (aIndex >= 0 || bIndex >= 0) return (aIndex >= 0 ? aIndex : Number.MAX_SAFE_INTEGER) - (bIndex >= 0 ? bIndex : Number.MAX_SAFE_INTEGER);
+    return a.localeCompare(b);
+  }).slice(0, 366);
+  const fillValue = Number(data?.header?.fill_value ?? -999);
+  const coordinates = Array.isArray(data?.geometry?.coordinates) ? data.geometry.coordinates : [];
+  const parameterMetadata = Object.fromEntries(codes.map((code) => [code, {
+    units: text(data?.parameters?.[code]?.units, 80),
+    long_name: text(data?.parameters?.[code]?.longname, 160),
+  }]));
+  const series: Record<string, Array<number | null>> = {};
+  for (const code of codes) {
+    series[code] = periods.map((period) => {
+      const value = parameterValues[code]?.[period];
+      const present = typeof value === "number" && Number.isFinite(value) && value !== fillValue;
+      return present ? value : null;
+    });
+  }
+  return {
+    location: {
+      longitude: coordinates[0] ?? null,
+      latitude: coordinates[1] ?? null,
+      elevation_m: coordinates[2] ?? null,
+    },
+    time_standard: data?.header?.time_standard ?? null,
+    requested_start: data?.header?.start ?? null,
+    requested_end: data?.header?.end ?? null,
+    climatology_range: data?.header?.range ?? null,
+    sources: Array.isArray(data?.header?.sources) ? data.header.sources.slice(0, 8) : [],
+    parameters: parameterMetadata,
+    data: {
+      periods: periods.map(formatPowerPeriod),
+      series,
+    },
+    messages: Array.isArray(data?.messages) ? data.messages.slice(0, 8).map((message: unknown) => text(message, 500)) : [],
+  };
 }
 
 export function compactValue(value: any, depth = 0, arrayLimit = 5): any {
@@ -475,6 +640,61 @@ async function getEpicEarth(args: JsonObject): Promise<JsonObject> {
   return { collection, requested_date: date, available_images: raw.length, images, source: response.source };
 }
 
+async function getPowerDaily(args: JsonObject): Promise<JsonObject> {
+  const coordinates = validatePowerCoordinates(args.latitude, args.longitude);
+  const range = validatePowerDateRange(args.start_date, args.end_date);
+  const parameters = resolvePowerParameters(args.parameters, args.profile);
+  validatePowerParameterCoverage(parameters, range.start_date);
+  validatePowerRequestSize(range.start_date, range.end_date, parameters.length);
+  const community = resolvePowerCommunity(args.community, args.profile, args.parameters);
+  const timeStandard = enumInput(args.time_standard, "LST", ["LST", "UTC"], "time_standard");
+  const response = await keylessGet(POWER_BASE, "/api/temporal/daily/point", {
+    parameters: parameters.join(","),
+    community,
+    longitude: String(coordinates.longitude),
+    latitude: String(coordinates.latitude),
+    start: range.start,
+    end: range.end,
+    format: "JSON",
+    "time-standard": timeStandard,
+  }, "NASA POWER daily");
+  return {
+    dataset: "NASA POWER daily historical data",
+    forecast: false,
+    requested_location: coordinates,
+    requested_start_date: range.start_date,
+    requested_end_date: range.end_date,
+    requested_profile: args.parameters === undefined ? (args.profile ?? "weather") : null,
+    requested_community: community,
+    requested_parameters: parameters,
+    ...normalizePowerData(response.data),
+    source: response.source,
+  };
+}
+
+async function getPowerClimatology(args: JsonObject): Promise<JsonObject> {
+  const coordinates = validatePowerCoordinates(args.latitude, args.longitude);
+  const parameters = resolvePowerParameters(args.parameters, args.profile);
+  const community = resolvePowerCommunity(args.community, args.profile, args.parameters);
+  const response = await keylessGet(POWER_BASE, "/api/temporal/climatology/point", {
+    parameters: parameters.join(","),
+    community,
+    longitude: String(coordinates.longitude),
+    latitude: String(coordinates.latitude),
+    format: "JSON",
+  }, "NASA POWER climatology");
+  return {
+    dataset: "NASA POWER monthly and annual climatology",
+    forecast: false,
+    requested_location: coordinates,
+    requested_profile: args.parameters === undefined ? (args.profile ?? "weather") : null,
+    requested_community: community,
+    requested_parameters: parameters,
+    ...normalizePowerData(response.data),
+    source: response.source,
+  };
+}
+
 async function getDailyBrief(args: JsonObject): Promise<JsonObject> {
   const lookback = boundedInt(args.lookback_days, 3, 1, 14, "lookback_days");
   const eventLimit = boundedInt(args.earth_event_limit, 8, 1, 20, "earth_event_limit");
@@ -515,6 +735,8 @@ export async function handleTool(name: string, args: JsonObject = {}): Promise<J
     case "nasa_earth_events": return getEarthEvents(args);
     case "nasa_space_weather": return getSpaceWeather(args);
     case "nasa_epic_earth": return getEpicEarth(args);
+    case "nasa_power_daily": return getPowerDaily(args);
+    case "nasa_power_climatology": return getPowerClimatology(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
